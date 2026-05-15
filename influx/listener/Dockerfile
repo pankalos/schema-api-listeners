@@ -5,10 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir influxdb-client requests
+RUN pip install --no-cache-dir requests
 
-COPY influxdb-listener.py /app/influxdb-listener.py
+COPY leaf-listener.py /app/leaf-listener.py
 
 # IMPORTANT: use CMD, NOT ENTRYPOINT
-# This prevents duplication when schema-api provides ["python","-u","influxdb-listener.py", ...]
-CMD ["python", "-u", "/app/influxdb-listener.py"]
+# This prevents duplication when schema-api provides ["python","-u","leaf-listener.py", ...]
+CMD ["python", "-u", "/app/leaf-listener.py"]
+

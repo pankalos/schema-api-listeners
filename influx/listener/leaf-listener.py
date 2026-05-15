@@ -3,23 +3,25 @@ import time
 import argparse
 import datetime as dt
 from datetime import timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
 
-# ---------------------------------------------------------
-# Helper: get value from CLI first, otherwise from env var
-# ---------------------------------------------------------
+# =========================================================
+# 1. SMALL HELPERS
+# =========================================================
+
 def env_or(cli_val: Optional[str], env_key: str) -> str:
     """
-    Use the CLI value if it exists.
+    Return the CLI value if the user gave one.
     Otherwise fallback to an environment variable.
 
     Example:
-      --api_url https://portal.m-unlock.com/api/data
+        --api_url https://portal.m-unlock.com/api/data
+
     or:
-      export LEAF_API_URL=https://portal.m-unlock.com/api/data
+        export LEAF_API_URL=https://portal.m-unlock.com/api/data
     """
     if cli_val:
         return cli_val
@@ -30,16 +32,15 @@ def env_or(cli_val: Optional[str], env_key: str) -> str:
     return val
 
 
-# ---------------------------------------------------------
-# Helper: convert epoch seconds -> ISO 8601 UTC string
-# ---------------------------------------------------------
 def to_iso_z(epoch_s: int) -> str:
     """
-    Convert epoch seconds to a UTC ISO timestamp like:
-      2026-04-20T23:59:30Z
+    Convert epoch seconds -> ISO UTC string with trailing Z.
 
-    We use this because LEAF accepts exact timestamps and
-    we confirmed the API behaves like [from, to).
+    Example:
+        1778156030 -> "2026-05-07T12:13:50Z"
+
+    We use this because you tested that LEAF accepts exact
+    timestamps with seconds, and that it behaves like [from, to).
     """
     return (
         dt.datetime.fromtimestamp(epoch_s, tz=timezone.utc)
@@ -48,58 +49,117 @@ def to_iso_z(epoch_s: int) -> str:
     )
 
 
-# ---------------------------------------------------------
-# Step 1: parse command-line arguments
-# ---------------------------------------------------------
+# =========================================================
+# 2. CLI ARGUMENTS
+# =========================================================
+
 def parse_args() -> argparse.Namespace:
     """
-    Define all CLI arguments used by the listener.
+    Define all command-line arguments.
 
-    We keep this simple:
-    - LEAF API read side
-    - modeler target
-    - polling cadence
+    This listener needs:
+    - where the modeler lives
+    - how to reach LEAF
+    - which organisation / department / entity / metrics to use
+    - how often to poll
     """
-    p = argparse.ArgumentParser(description="Simple LEAF listener")
+    p = argparse.ArgumentParser(
+        description="LEAF listener that fetches multiple metrics, combines them, and sends them to a modeler."
+    )
 
-    # -------------------------
-    # Modeler service settings
-    # -------------------------
-    p.add_argument("--target_service", required=True, help="Modeler host or k8s service name")
-    p.add_argument("--target_endpoint", required=True, help="Modeler endpoint, e.g. model")
-    p.add_argument("--port", required=True, help="Modeler port")
+    # -----------------------------
+    # Modeler connection parameters
+    # -----------------------------
+    p.add_argument(
+        "--target_service",
+        required=True,
+        help="Modeler host or k8s service name, e.g. 127.0.0.1 or modeler-service"
+    )
+    p.add_argument(
+        "--target_endpoint",
+        required=True,
+        help="Modeler endpoint, e.g. model"
+    )
+    p.add_argument(
+        "--port",
+        required=True,
+        help="Modeler port, e.g. 8080"
+    )
 
-    # -------------------------
-    # LEAF API settings
-    # -------------------------
-    p.add_argument("--api_url", default=None, help="LEAF API URL or env LEAF_API_URL")
-    p.add_argument("--token", default=None, help="LEAF API token or env LEAF_API_TOKEN")
+    # -----------------------------
+    # LEAF API connection parameters
+    # -----------------------------
+    p.add_argument(
+        "--api_url",
+        default=None,
+        help="LEAF API URL, or env LEAF_API_URL"
+    )
+    p.add_argument(
+        "--token",
+        default=None,
+        help="LEAF API token, or env LEAF_API_TOKEN"
+    )
+
+    # -----------------------------
+    # Required LEAF query fields
+    # -----------------------------
     p.add_argument("--organisation", required=True)
     p.add_argument("--department", required=True)
-    p.add_argument("--entity", default=None)
-    p.add_argument("--metric", required=True)
 
-    # -------------------------
-    # Polling interval
-    # -------------------------
-    p.add_argument("--everyTs", type=int, required=True, help="Poll every N seconds")
+    # -----------------------------
+    # Optional LEAF query field
+    # -----------------------------
+    p.add_argument(
+        "--entity",
+        default=None,
+        help="Optional entity filter. Strongly recommended for this simple listener."
+    )
 
-    # -------------------------
-    # Optional: also send time vector to modeler
-    # -------------------------
+    # -----------------------------
+    # One or more metrics
+    # Example:
+    #   --metrics mem.used disk.used cpu.usage_idle
+    # -----------------------------
+    p.add_argument(
+        "--metrics",
+        nargs="+",
+        required=True,
+        help="One or more metric names"
+    )
+
+    # -----------------------------
+    # Polling cadence
+    # Example:
+    #   --everyTs 10
+    # means target cadence is every 10 sec.
+    # If the loop takes longer than 10 sec, do not sleep.
+    # -----------------------------
+    p.add_argument(
+        "--everyTs",
+        type=int,
+        required=True,
+        help="Polling cadence in seconds"
+    )
+
+    # -----------------------------
+    # Optional: include time vector
+    # If set, payload sent to modeler will also contain:
+    #   "ts": [epoch1, epoch2, ...]
+    # -----------------------------
     p.add_argument(
         "--include_time_to_mod",
         action="store_true",
-        help="If set, send timestamps to modeler under key 'ts' as epoch ints",
+        help="If set, include timestamps under fixed key 'ts'"
     )
 
     return p.parse_args()
 
 
-# ---------------------------------------------------------
-# Step 2: query LEAF API for one rolling time window
-# ---------------------------------------------------------
-def fetch_leaf_rows(
+# =========================================================
+# 3. READ ONE METRIC FROM LEAF
+# =========================================================
+
+def fetch_leaf_rows_for_one_metric(
     session: requests.Session,
     api_url: str,
     token: str,
@@ -111,17 +171,23 @@ def fetch_leaf_rows(
     stop_s: int,
 ) -> List[dict]:
     """
-    Query LEAF for the window [start_s, stop_s).
+    Query LEAF for a SINGLE metric in a SINGLE time window.
 
-    Example query built by this function:
-      ?organisation=UNLOCK
-      &department=FDP
-      &entity=ichibi.wurnet.nl
-      &metric=mem.used
-      &from=2026-04-20T23:59:30Z
-      &to=2026-04-20T23:59:40Z
+    Window semantics:
+        [start_s, stop_s)
+
+    So:
+        from is included
+        to is excluded
+
+    Example request:
+        organisation=UNLOCK
+        department=FDP
+        entity=ichibi.wurnet.nl
+        metric=mem.used
+        from=2026-05-07T12:13:50Z
+        to=2026-05-07T12:14:00Z
     """
-    # Build query parameters exactly as LEAF expects them
     params = {
         "organisation": organisation,
         "department": department,
@@ -130,241 +196,346 @@ def fetch_leaf_rows(
         "to": to_iso_z(stop_s),
     }
 
-    # Add entity only if the user provided one
+    # Add entity only if user gave one
     if entity:
         params["entity"] = entity
 
-    # Make the HTTP GET request
-    resp = session.get(
+    response = session.get(
         api_url,
         params=params,
         headers={
             "accept": "application/json",
             "Authorization": f"Bearer {token}",
         },
-        # Generous timeout because the API can be slow
+        # Large timeout because LEAF may respond slowly
         timeout=(10, 300),
     )
 
-    # Raise an exception if HTTP status is not 2xx
-    resp.raise_for_status()
+    # Crash this cycle if HTTP status is not success
+    response.raise_for_status()
 
-    # Parse the JSON body
-    data = resp.json()
+    data = response.json()
 
-    # We expect a list of rows
     if not isinstance(data, list):
-        raise RuntimeError("LEAF API response must be a JSON list.")
+        raise RuntimeError(
+            f"LEAF API response for metric '{metric}' must be a JSON list."
+        )
 
     return data
 
 
-# ---------------------------------------------------------
-# Step 3: convert LEAF rows -> modeler payload
-# ---------------------------------------------------------
-def build_payload(
-    rows: List[dict],
-    metric: str,
+# =========================================================
+# 4. READ ALL REQUESTED METRICS
+# =========================================================
+
+def fetch_all_metrics(
+    session: requests.Session,
+    api_url: str,
+    token: str,
+    organisation: str,
+    department: str,
+    metrics: List[str],
+    entity: Optional[str],
+    start_s: int,
+    stop_s: int,
+) -> Dict[str, List[dict]]:
+    """
+    Query LEAF ONCE PER METRIC using the SAME time window.
+
+    Output example:
+        {
+          "mem.used": [...rows...],
+          "disk.used": [...rows...]
+        }
+
+    This is the simplest safe way to support multiple metrics,
+    since LEAF did not appear to support multi-metric filtering
+    in one request.
+    """
+    rows_by_metric: Dict[str, List[dict]] = {}
+
+    for metric in metrics:
+        print(
+            f"[listener] Fetching metric '{metric}' "
+            f"from {to_iso_z(start_s)} to {to_iso_z(stop_s)}"
+        )
+
+        rows = fetch_leaf_rows_for_one_metric(
+            session=session,
+            api_url=api_url,
+            token=token,
+            organisation=organisation,
+            department=department,
+            metric=metric,
+            entity=entity,
+            start_s=start_s,
+            stop_s=stop_s,
+        )
+
+        print(f"[listener] Metric '{metric}' returned {len(rows)} row(s)")
+        rows_by_metric[metric] = rows
+
+    return rows_by_metric
+
+
+# =========================================================
+# 5. COMBINE METRICS INTO ONE MODELER PAYLOAD
+# =========================================================
+
+def build_combined_payload(
+    rows_by_metric: Dict[str, List[dict]],
     entity: Optional[str],
     include_time: bool,
 ) -> Dict[str, Any]:
     """
-    Convert LEAF rows into the modeler payload.
+    Example input from LEAF:
 
-    Input rows look like:
-      {
-        "time": "2026-04-20T23:59:40+00:00",
-        "entity": "ichibi.wurnet.nl",
-        "metric": "mem.used",
-        "value": 21967122432.0,
-        ...
-      }
-
-    Output payload becomes something like:
-      {
-        "mem.used": [22445219840.0, 21967122432.0],
-        "ts": [1776739170, 1776739180]
-      }
-
-    Notes:
-    - We sort oldest -> newest before sending to modeler
-    - We keep only the requested metric
-    - If entity is given, we keep only that entity
-    """
-    filtered: List[dict] = []
-
-    # Keep only rows that match the requested metric and entity
-    for row in rows:
-        if row.get("metric") != metric:
-            continue
-        if entity is not None and row.get("entity") != entity:
-            continue
-        filtered.append(row)
-
-    # If user did not provide entity, this simple version expects
-    # only one entity to appear in the filtered result
-    if entity is None:
-        entities = {row.get("entity") for row in filtered}
-        if len(entities) > 1:
-            raise RuntimeError(
-                f"Multiple entities returned: {entities}. "
-                f"For this simple listener, pass --entity."
-            )
-
-    # If nothing matched, return an empty payload
-    if not filtered:
-        return {"ts": []} if include_time else {}
-
-    # Sort oldest -> newest so the modeler receives time-ordered input
-    filtered.sort(key=lambda r: r["time"])
-
-    # Build lists for:
-    # - the metric values
-    # - the timestamps (optional)
-    values: List[Any] = []
-    ts_list: List[int] = []
-
-    for row in filtered:
-        # Each row has exactly one value
-        values.append(row["value"])
-
-        # Convert LEAF time string to epoch seconds
-        row_dt = dt.datetime.fromisoformat(row["time"])
-        ts_list.append(int(row_dt.timestamp()))
-
-    # Main payload: key is the metric name
-    payload: Dict[str, Any] = {
-        metric: values
+    rows_by_metric = {
+        "mem.used": [
+            {"time": "2026-05-07T12:00:10+00:00", "entity": "ichibi.wurnet.nl", "metric": "mem.used", "value": 100},
+            {"time": "2026-05-07T12:00:20+00:00", "entity": "ichibi.wurnet.nl", "metric": "mem.used", "value": 101},
+            {"time": "2026-05-07T12:00:30+00:00", "entity": "ichibi.wurnet.nl", "metric": "mem.used", "value": 102},
+        ],
+        "disk.used": [
+            {"time": "2026-05-07T12:00:10+00:00", "entity": "ichibi.wurnet.nl", "metric": "disk.used", "value": 900},
+            {"time": "2026-05-07T12:00:20+00:00", "entity": "ichibi.wurnet.nl", "metric": "disk.used", "value": 901},
+            {"time": "2026-05-07T12:00:30+00:00", "entity": "ichibi.wurnet.nl", "metric": "disk.used", "value": 902},
+        ],
     }
 
-    # Optionally include timestamps under fixed key "ts"
+    Desired final payload:
+
+    {
+        "mem.used": [100, 101, 102],
+        "disk.used": [900, 901, 902],
+        "ts": [t1, t2, t3]
+    }
+
+    Why do we first build timestamp -> value dictionaries?
+
+    Because it makes alignment easy.
+
+    Example temporary form:
+
+    mem_map = {
+        t1: 100,
+        t2: 101,
+        t3: 102,
+    }
+
+    disk_map = {
+        t1: 900,
+        t2: 901,
+        t3: 902,
+    }
+
+    Then we can safely say:
+      common timestamps = [t1, t2, t3]
+
+    And from that we build the final lists.
+    """
+
+    # This will temporarily hold one dict per metric:
+    #
+    # metric_maps["mem.used"]  = {t1: 100, t2: 101, t3: 102}
+    # metric_maps["disk.used"] = {t1: 900, t2: 901, t3: 902}
+    metric_maps: Dict[str, Dict[int, Any]] = {}
+
+    # --------------------------------------------------
+    # Step 1: convert each metric's rows into:
+    #         timestamp -> value
+    # --------------------------------------------------
+    for metric, rows in rows_by_metric.items():
+        one_metric_map: Dict[int, Any] = {}
+
+        for row in rows:
+            # If entity filter was given, ignore rows from other entities
+            if entity is not None and row.get("entity") != entity:
+                continue
+
+            # Convert ISO time string to epoch seconds
+            row_dt = dt.datetime.fromisoformat(row["time"])
+            ts = int(row_dt.timestamp())
+
+            # Store the value under that timestamp
+            one_metric_map[ts] = row["value"]
+
+        metric_maps[metric] = one_metric_map
+
+    # --------------------------------------------------
+    # Step 2: find timestamps common to ALL metrics
+    # --------------------------------------------------
+    #
+    # Example:
+    # mem.used  has {10, 20, 30}
+    # disk.used has {20, 30, 40}
+    #
+    # common_ts becomes {20, 30}
+    #
+    common_ts: Optional[Set[int]] = None
+
+    for metric, one_metric_map in metric_maps.items():
+        metric_timestamps = set(one_metric_map.keys())
+
+        if common_ts is None:
+            # First metric initializes the set
+            common_ts = metric_timestamps
+        else:
+            # Keep only timestamps that also exist in this metric
+            common_ts = common_ts.intersection(metric_timestamps)
+
+    # If no common timestamps exist, return empty payload
+    if common_ts is None or len(common_ts) == 0:
+        return {"ts": []} if include_time else {}
+
+    # --------------------------------------------------
+    # Step 3: sort timestamps oldest -> newest
+    # --------------------------------------------------
+    ordered_ts = sorted(common_ts)
+
+    # --------------------------------------------------
+    # Step 4: build final dict-of-lists payload
+    # --------------------------------------------------
+    payload: Dict[str, Any] = {}
+
+    for metric, one_metric_map in metric_maps.items():
+        # For each timestamp in ordered_ts, pick the matching value
+        payload[metric] = [one_metric_map[ts] for ts in ordered_ts]
+
     if include_time:
-        payload["ts"] = ts_list
+        payload["ts"] = ordered_ts
 
     return payload
 
 
-# ---------------------------------------------------------
-# Step 4: main listener loop
-# ---------------------------------------------------------
+# =========================================================
+# 6. MAIN LISTENER LOOP
+# =========================================================
+
 def main() -> None:
-    # Parse CLI args
+    # Parse user arguments
     args = parse_args()
 
-    # Basic validation
     if args.everyTs <= 0:
         raise SystemExit("--everyTs must be a positive integer.")
 
-    # Resolve API URL and token from CLI or env vars
+    # Resolve API URL and token from CLI or env
     api_url = env_or(args.api_url, "LEAF_API_URL")
     token = env_or(args.token, "LEAF_API_TOKEN")
 
-    # Build the final modeler URL
+    # Build modeler URL
     # Example:
-    #   http://modeler-service:8080/model
+    #   http://127.0.0.1:8080/model
     endpoint = args.target_endpoint.lstrip("/")
     modeler_url = f"http://{args.target_service}:{args.port}/{endpoint}"
 
-    print(f'modeler_url: {modeler_url}')
+    print(f"modeler_url: {modeler_url}")
 
-    # Reuse one HTTP session for better efficiency
+    # Reuse one HTTP session for efficiency
     session = requests.Session()
 
-    # -------------------------------------------------
-    # Initial rolling window: last everyTs seconds
-    # -------------------------------------------------
-    # Example if everyTs=10:
-    #   start = now - 10
-    #   stop  = now
+    # -----------------------------------------------------
+    # Step 6.1: initial time window = last everyTs seconds
+    # -----------------------------------------------------
+    # Example:
+    #   if now = 12:14:00 and everyTs=10
+    #   start = 12:13:50
+    #   stop  = 12:14:00
     now_s = int(dt.datetime.now(timezone.utc).timestamp())
     start_s = now_s - args.everyTs
     stop_s = now_s
 
-    # -------------------------------------------------
-    # Cadence timer, same idea as old listener
-    # -------------------------------------------------
-    # This is the important behavior we want:
-    # - if work finishes early, wait until next tick
-    # - if work is slow, do not wait; start immediately
+    # -----------------------------------------------------
+    # Step 6.2: cadence timer
+    # -----------------------------------------------------
+    # This keeps the same idea as your old listener:
+    # - if work is fast, wait until next tick
+    # - if work is slow, do not wait
     tick = time.monotonic()
 
-    # -------------------------------------------------
-    # Infinite polling loop
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # Step 6.3: infinite loop
+    # -----------------------------------------------------
     while True:
         try:
-            # -------------------------
-            # Step 4.1: fetch from LEAF
-            # -------------------------
-            print(f"[listener] Querying LEAF from {to_iso_z(start_s)} to {to_iso_z(stop_s)}")
-
-            rows = fetch_leaf_rows(
+            # =============================================
+            # A. Fetch all requested metrics for same window
+            # =============================================
+            start_query_time = time.monotonic()
+            rows_by_metric = fetch_all_metrics(
                 session=session,
                 api_url=api_url,
                 token=token,
                 organisation=args.organisation,
                 department=args.department,
-                metric=args.metric,
+                metrics=args.metrics,
                 entity=args.entity,
                 start_s=start_s,
                 stop_s=stop_s,
             )
 
-            print(f"[listener] Got {len(rows)} row(s) from LEAF")
-            # print(f'rows: {rows}')
-            print(f'time: {time.monotonic() - tick}')
+            elapsed = time.monotonic() - start_query_time
+            window_size = stop_s - start_s
 
-            # -------------------------
-            # Step 4.2: build payload
-            # -------------------------
-            payload = build_payload(
-                rows=rows,
-                metric=args.metric,
+            print(f"[listener] fetch_all_metrics took {elapsed:.2f} sec")
+            print(f"[listener] queried window size was {window_size} sec")
+
+            # =============================================
+            # B. Combine rows into one payload for modeler
+            # =============================================
+            payload = build_combined_payload(
+                rows_by_metric=rows_by_metric,
                 entity=args.entity,
                 include_time=args.include_time_to_mod,
             )
 
-            # -------------------------
-            # Step 4.3: if no data, skip modeler call
-            # -------------------------
-            if not payload or (args.metric in payload and len(payload[args.metric]) == 0):
-                print("[listener] No matching rows in this window.")
+            # =============================================
+            # C. Check whether combined payload has data
+            # =============================================
+            metric_keys = [m for m in args.metrics if m in payload]
+            has_data = bool(metric_keys) and len(payload[metric_keys[0]]) > 0
 
+            if not payload or not has_data:
+                print("[listener] No aligned rows found across all requested metrics in this window.")
             else:
                 print(f"[listener] Sending payload to modeler: keys={list(payload.keys())}")
-                print(f'payload: {payload}')
+                print(f"payload: {payload}")
 
-                # -------------------------
-                # Step 4.4: call modeler
-                # -------------------------
-                resp = session.post(
+                # =============================================
+                # D. Send payload to modeler
+                # =============================================
+                response = session.post(
                     modeler_url,
                     json=payload,
                     timeout=(10, 300),
                 )
-                resp.raise_for_status()
+                response.raise_for_status()
 
-                # -------------------------
-                # Step 4.5: print modeler response
-                # -------------------------
+                # =============================================
+                # E. Print modeler response
+                # =============================================
                 try:
                     print("[listener] Modeler response JSON:")
-                    print(resp.json())
+                    print(response.json())
                 except Exception:
                     print("[listener] Modeler response text:")
-                    print(resp.text)
+                    print(response.text)
 
         except Exception as e:
-            # For now, keep it simple: log the error and continue
+            # Keep the listener alive even if one cycle fails
             print(f"[listener] ERROR: {e}")
 
         # -------------------------------------------------
-        # Step 5: old-listener cadence logic
+        # Step 6.4: same cadence logic as old listener
         # -------------------------------------------------
-        # We increase the target tick by everyTs.
-        # Then:
-        # - if there is time left, sleep
-        # - if not, start immediately
+        # We target one cycle every everyTs seconds.
+        #
+        # If current cycle finished early:
+        #   sleep until next tick
+        #
+        # If current cycle took too long:
+        #   do not sleep
+        #   start next cycle immediately
         tick += args.everyTs
         sleep_s = tick - time.monotonic()
 
@@ -376,20 +547,23 @@ def main() -> None:
             tick = time.monotonic()
 
         # -------------------------------------------------
-        # Step 6: advance the rolling window
+        # Step 6.5: advance rolling time window
         # -------------------------------------------------
-        # This is the key behavior:
+        # This is the important old-listener behavior:
+        #
         #   next start = previous stop
         #   next stop  = NOW
         #
-        # So if the LEAF API takes 2m40s, the next request
-        # automatically covers that full missed period.
+        # So if LEAF is slow and one cycle takes 2m40s,
+        # the next request automatically covers that whole
+        # missed period.
         start_s = stop_s
         stop_s = int(dt.datetime.now(timezone.utc).timestamp())
 
 
-# ---------------------------------------------------------
-# Script entry point
-# ---------------------------------------------------------
+# =========================================================
+# 7. ENTRY POINT
+# =========================================================
+
 if __name__ == "__main__":
     main()
