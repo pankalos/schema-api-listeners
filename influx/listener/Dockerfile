@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir requests
+RUN pip install --no-cache-dir requests paho-mqtt
 
 COPY leaf-listener.py /app/leaf-listener.py
 

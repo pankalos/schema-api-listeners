@@ -6,6 +6,7 @@ from datetime import timezone
 from typing import Any, Dict, List, Optional, Set
 
 import requests
+import paho.mqtt.client as mqtt
 
 
 # =========================================================
@@ -32,6 +33,16 @@ def env_or(cli_val: Optional[str], env_key: str) -> str:
     return val
 
 
+def env_or_none(cli_val: Optional[str], env_key: str) -> Optional[str]:
+    """
+    Return CLI value if provided, otherwise environment variable if present.
+    If neither exists, return None.
+    """
+    if cli_val:
+        return cli_val
+    return os.getenv(env_key)
+
+
 def to_iso_z(epoch_s: int) -> str:
     """
     Convert epoch seconds -> ISO UTC string with trailing Z.
@@ -39,7 +50,7 @@ def to_iso_z(epoch_s: int) -> str:
     Example:
         1778156030 -> "2026-05-07T12:13:50Z"
 
-    We use this because you tested that LEAF accepts exact
+    We use this because we tested that LEAF accepts exact
     timestamps with seconds, and that it behaves like [from, to).
     """
     return (
@@ -47,6 +58,55 @@ def to_iso_z(epoch_s: int) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def escape_measurement_or_tag(s: str) -> str:
+    """
+    Escape measurement names and tag keys/values for Influx line protocol.
+    """
+    return str(s).replace("\\", "\\\\").replace(" ", "\\ ").replace(",", "\\,").replace("=", "\\=")
+
+
+def escape_field_key(s: str) -> str:
+    """
+    Escape field keys for Influx line protocol.
+    """
+    return str(s).replace("\\", "\\\\").replace(" ", "\\ ").replace(",", "\\,").replace("=", "\\=")
+
+
+def encode_field_value(value: Any) -> str:
+    """
+    Encode a Python value as an Influx line protocol field value.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value}i"
+    if isinstance(value, float):
+        return str(value)
+
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def parse_output_tags(tag_pairs: List[str]) -> Dict[str, str]:
+    """
+    Parse:
+      ["workflow=test", "producer=leaf-listener"]
+    into:
+      {"workflow": "test", "producer": "leaf-listener"}
+    """
+    tags: Dict[str, str] = {}
+
+    for pair in tag_pairs:
+        if "=" not in pair:
+            raise SystemExit(f"Bad output tag '{pair}'. Expected key=value.")
+        k, v = pair.split("=", 1)
+        if not k:
+            raise SystemExit(f"Bad output tag '{pair}'. Empty key.")
+        tags[k] = v
+
+    return tags
 
 
 # =========================================================
@@ -60,11 +120,12 @@ def parse_args() -> argparse.Namespace:
     This listener needs:
     - where the modeler lives
     - how to reach LEAF
-    - which organisation / department / entity / metrics to use
+    - which organization / department / entity / metrics to use
     - how often to poll
+    - MQTT write-back settings
     """
     p = argparse.ArgumentParser(
-        description="LEAF listener that fetches multiple metrics, combines them, and sends them to a modeler."
+        description="LEAF listener that fetches multiple metrics, combines them, sends them to a modeler, and optionally writes results back to MQTT."
     )
 
     # -----------------------------
@@ -111,8 +172,8 @@ def parse_args() -> argparse.Namespace:
     # -----------------------------
     p.add_argument(
         "--entity",
-        default=None,
-        help="Optional entity filter. Strongly recommended for this simple listener."
+        required=True,
+        help="Required entity filter, e.g. ssb.bioind4"
     )
 
     # -----------------------------
@@ -142,14 +203,22 @@ def parse_args() -> argparse.Namespace:
     )
 
     # -----------------------------
-    # Optional: include time vector
-    # If set, payload sent to modeler will also contain:
-    #   "ts": [epoch1, epoch2, ...]
+    # MQTT write-back parameters
+    # If mqtt_topic is given, the listener will publish one
+    # MQTT message per result point.
     # -----------------------------
+    p.add_argument("--mqtt_host", default=None, help="MQTT host")
+    p.add_argument("--mqtt_port", type=int, default=443, help="MQTT port")
+    p.add_argument("--mqtt_username", default=None, help="MQTT username")
+    p.add_argument("--mqtt_password", default=None, help="MQTT password")
+    p.add_argument("--mqtt_topic", default=None, help="MQTT topic, e.g. athenarc/test")
+    p.add_argument("--mqtt_basepath", default="mqtt", help="MQTT websocket basepath, e.g. mqtt")
+    p.add_argument("--mqtt_measurement", default=None, help="Influx line protocol measurement")
     p.add_argument(
-        "--include_time_to_mod",
-        action="store_true",
-        help="If set, include timestamps under fixed key 'ts'"
+        "--output_tags",
+        nargs="*",
+        default=[],
+        help='Optional extra output tags, e.g. --output_tags workflow=test producer=leaf-listener'
     )
 
     return p.parse_args()
@@ -285,7 +354,6 @@ def fetch_all_metrics(
 def build_combined_payload(
     rows_by_metric: Dict[str, List[dict]],
     entity: Optional[str],
-    include_time: bool,
 ) -> Dict[str, Any]:
     """
     Example input from LEAF:
@@ -311,28 +379,8 @@ def build_combined_payload(
         "ts": [t1, t2, t3]
     }
 
-    Why do we first build timestamp -> value dictionaries?
-
-    Because it makes alignment easy.
-
-    Example temporary form:
-
-    mem_map = {
-        t1: 100,
-        t2: 101,
-        t3: 102,
-    }
-
-    disk_map = {
-        t1: 900,
-        t2: 901,
-        t3: 902,
-    }
-
-    Then we can safely say:
-      common timestamps = [t1, t2, t3]
-
-    And from that we build the final lists.
+    The timestamp column is ALWAYS included now.
+    The modeler will receive "ts" and must also return "ts" back.
     """
 
     # This will temporarily hold one dict per metric:
@@ -365,13 +413,6 @@ def build_combined_payload(
     # --------------------------------------------------
     # Step 2: find timestamps common to ALL metrics
     # --------------------------------------------------
-    #
-    # Example:
-    # mem.used  has {10, 20, 30}
-    # disk.used has {20, 30, 40}
-    #
-    # common_ts becomes {20, 30}
-    #
     common_ts: Optional[Set[int]] = None
 
     for metric, one_metric_map in metric_maps.items():
@@ -386,7 +427,7 @@ def build_combined_payload(
 
     # If no common timestamps exist, return empty payload
     if common_ts is None or len(common_ts) == 0:
-        return {"ts": []} if include_time else {}
+        return {"ts": []}
 
     # --------------------------------------------------
     # Step 3: sort timestamps oldest -> newest
@@ -402,10 +443,137 @@ def build_combined_payload(
         # For each timestamp in ordered_ts, pick the matching value
         payload[metric] = [one_metric_map[ts] for ts in ordered_ts]
 
-    if include_time:
-        payload["ts"] = ordered_ts
+    # Timestamp column is always present
+    payload["ts"] = ordered_ts
 
     return payload
+
+
+# =========================================================
+# 5b. MQTT SINGLE-POINT WRITE-BACK HELPERS
+# =========================================================
+
+def build_line_protocol_rows(
+    modeler_output: Dict[str, Any],
+    measurement: str,
+    output_tags: List[str],
+) -> List[str]:
+    """
+    Convert the modeler output dict-of-lists into ONE line-protocol row PER POINT.
+
+    Example modeler output:
+      {
+        "mem.used": [521, 522],
+        "disk.used": [605, 606],
+        "ts": [1778753890, 1778753900]
+      }
+
+    With:
+      measurement = "model_predictions"
+      output_tags = ["workflow=test", "producer=leaf-listener", "model=dummy-v1"]
+
+    Output:
+      [
+        'model_predictions,workflow=test,producer=leaf-listener,model=dummy-v1 mem.used=521i,disk.used=605i 1778753890000000000',
+        'model_predictions,workflow=test,producer=leaf-listener,model=dummy-v1 mem.used=522i,disk.used=606i 1778753900000000000'
+      ]
+
+    Important:
+    - organisation / department / entity are NOT written as line-protocol tags.
+    - They are used only for selecting LEAF source data and choosing the MQTT topic.
+    """
+    if not measurement:
+        raise RuntimeError("MQTT measurement is required.")
+
+    if "ts" not in modeler_output:
+        raise RuntimeError("Modeler output must contain 'ts'.")
+
+    if not isinstance(modeler_output["ts"], list):
+        raise RuntimeError("Modeler output key 'ts' must be a list.")
+
+    ts_values = modeler_output["ts"]
+    n = len(ts_values)
+
+    # All non-ts columns become fields.
+    field_keys = [k for k in modeler_output.keys() if k != "ts"]
+
+    if not field_keys:
+        raise RuntimeError("Modeler output must contain at least one non-'ts' field.")
+
+    for k in field_keys:
+        if not isinstance(modeler_output[k], list):
+            raise RuntimeError(f"Modeler output key '{k}' must be a list.")
+        if len(modeler_output[k]) != n:
+            raise RuntimeError(
+                f"Length mismatch for '{k}'. Expected {n}, got {len(modeler_output[k])}."
+            )
+
+    # Only user-provided output_tags are written as tags.
+    # No organisation / department / entity tags here.
+    tags = parse_output_tags(output_tags)
+
+    tag_part = ",".join(
+        f"{escape_measurement_or_tag(k)}={escape_measurement_or_tag(v)}"
+        for k, v in tags.items()
+    )
+
+    measurement_part = escape_measurement_or_tag(measurement)
+
+    if tag_part:
+        measurement_and_tags = f"{measurement_part},{tag_part}"
+    else:
+        measurement_and_tags = measurement_part
+
+    rows: List[str] = []
+
+    for i in range(n):
+        field_part = ",".join(
+            f"{escape_field_key(k)}={encode_field_value(modeler_output[k][i])}"
+            for k in field_keys
+        )
+
+        # Modeler returns ts in UTC epoch seconds.
+        # Influx line protocol expects nanoseconds here.
+        ts_ns = int(ts_values[i]) * 1_000_000_000
+
+        line = f"{measurement_and_tags} {field_part} {ts_ns}"
+        rows.append(line)
+
+    return rows
+
+
+def publish_rows_to_mqtt(
+    mqtt_host: str,
+    mqtt_port: int,
+    mqtt_username: str,
+    mqtt_password: str,
+    mqtt_topic: str,
+    mqtt_basepath: str,
+    rows: List[str],
+) -> None:
+    """
+    Publish ONE MQTT MESSAGE PER LINE-PROTOCOL ROW.
+
+    So:
+      1 row  -> 1 publish
+      10 rows -> 10 publishes
+    """
+    client = mqtt.Client(transport="websockets")
+    client.username_pw_set(mqtt_username, mqtt_password)
+    client.tls_set()
+    client.ws_set_options(path=f"/{mqtt_basepath.lstrip('/')}")
+
+    client.connect(mqtt_host, mqtt_port, keepalive=60)
+    client.loop_start()
+
+    try:
+        for row in rows:
+            print(f"[listener] MQTT publish to '{mqtt_topic}': {row}")
+            info = client.publish(mqtt_topic, row, qos=0, retain=False)
+            info.wait_for_publish()
+    finally:
+        client.loop_stop()
+        client.disconnect()
 
 
 # =========================================================
@@ -423,6 +591,12 @@ def main() -> None:
     api_url = env_or(args.api_url, "LEAF_API_URL")
     token = env_or(args.token, "LEAF_API_TOKEN")
 
+    mqtt_host = env_or_none(args.mqtt_host, "MQTT_HOST")
+    mqtt_username = env_or_none(args.mqtt_username, "MQTT_USERNAME")
+    mqtt_password = env_or_none(args.mqtt_password, "MQTT_PASSWORD")
+    mqtt_topic = env_or_none(args.mqtt_topic, "MQTT_TOPIC")
+
+
     # Build modeler URL
     # Example:
     #   http://127.0.0.1:8080/model
@@ -437,10 +611,6 @@ def main() -> None:
     # -----------------------------------------------------
     # Step 6.1: initial time window = last everyTs seconds
     # -----------------------------------------------------
-    # Example:
-    #   if now = 12:14:00 and everyTs=10
-    #   start = 12:13:50
-    #   stop  = 12:14:00
     now_s = int(dt.datetime.now(timezone.utc).timestamp())
     start_s = now_s - args.everyTs
     stop_s = now_s
@@ -486,7 +656,6 @@ def main() -> None:
             payload = build_combined_payload(
                 rows_by_metric=rows_by_metric,
                 entity=args.entity,
-                include_time=args.include_time_to_mod,
             )
 
             # =============================================
@@ -512,18 +681,47 @@ def main() -> None:
                 response.raise_for_status()
 
                 # =============================================
-                # E. Print modeler response
+                # E. Read modeler response JSON
                 # =============================================
-                try:
-                    print("[listener] Modeler response JSON:")
-                    print(response.json())
-                except Exception:
-                    print("[listener] Modeler response text:")
-                    print(response.text)
+                modeler_output = response.json()
+                print("[listener] Modeler response JSON:")
+                print(modeler_output)
+
+                # =============================================
+                # F. Optional MQTT single-point write-back
+                # =============================================
+                if mqtt_topic:
+                    if not mqtt_host:
+                        raise RuntimeError("--mqtt_host or env MQTT_HOST is required when MQTT write-back is enabled.")
+                    if not mqtt_username:
+                        raise RuntimeError("--mqtt_username or env MQTT_USERNAME is required when MQTT write-back is enabled.")
+                    if mqtt_password is None:
+                        raise RuntimeError("--mqtt_password or env MQTT_PASSWORD is required when MQTT write-back is enabled.")
+                    if not args.mqtt_measurement:
+                        raise RuntimeError("--mqtt_measurement is required when MQTT write-back is enabled.")
+
+                    rows = build_line_protocol_rows(
+                        modeler_output=modeler_output,
+                        measurement=args.mqtt_measurement,
+                        output_tags=args.output_tags,
+                    )
+
+                    print(f"[listener] Built {len(rows)} line-protocol row(s) for MQTT")
+
+                    publish_rows_to_mqtt(
+                        mqtt_host=mqtt_host,
+                        mqtt_port=args.mqtt_port,
+                        mqtt_username=mqtt_username,
+                        mqtt_password=mqtt_password,
+                        mqtt_topic=mqtt_topic,
+                        mqtt_basepath=args.mqtt_basepath,
+                        rows=rows,
+                    )
 
         except Exception as e:
             # Keep the listener alive even if one cycle fails
             print(f"[listener] ERROR: {e}")
+            raise
 
         # -------------------------------------------------
         # Step 6.4: same cadence logic as old listener
