@@ -49,7 +49,7 @@ def model():
 
         # 2. Strings -> add "_m" to each string
         elif isinstance(vlist[0], str):
-            out_dic[k] = [f"{item}_m" for item in v]
+            out_dic[k] = [f"{item}_m" for item in vlist]
 
         # 3. Numbers (int or float) -> keep first 3 digits
         elif isinstance(vlist[0], (int, float)):
