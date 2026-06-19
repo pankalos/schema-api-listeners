@@ -13,7 +13,6 @@ def first_3_digits_as_int(x):
       -98.76        -> 987
       7             -> 7
     """
-    # Convert to string, keep only digits
     digits = "".join(ch for ch in str(x) if ch.isdigit())
 
     if not digits:
@@ -22,48 +21,105 @@ def first_3_digits_as_int(x):
     return int(digits[:3])
 
 
+
 @app.route("/model", methods=["POST"])
 def model():
+    """
+    Dummy modeler for the new listener protocol.
+
+    Input:
+      [
+        {
+          "entity": "D0167289",
+          "metric": "Temperature.process-value",
+          "time": [1781690000, 1781690002],
+          "values": [23.325, 23.34]
+        }
+      ]
+
+    Output:
+      {
+        "x_pred": [...],
+        "y_pred": [...],
+        "z_pred": [...],
+        "ts": [...]
+      }
+
+    Important:
+      - ts is UTC epoch seconds, not nanoseconds.
+      - Listener validates output column lengths.
+    """
     payload = request.get_json(force=True)
 
-    if not isinstance(payload, dict):
-        return jsonify(error="Payload must be a JSON object of key -> list"), 400
+    if not isinstance(payload, list):
+        return jsonify(error="Payload must be a JSON list of series objects"), 400
 
     print(f"payload: {payload}")
 
-    out_dic = {}
+    # Pick the first non-empty input series as the base timeline for this dummy model.
+    base_time = []
+    base_values = []
 
-    for k, vlist in payload.items():
-        # Basic validation: each value should be a list
-        if not isinstance(vlist, list):
-            return jsonify(error=f"Value for key '{k}' must be a list"), 400
+    for series in payload:
+        if not isinstance(series, dict):
+            return jsonify(error="Each series must be a JSON object"), 400
 
-        # If list is empty, just return empty list
-        if len(vlist) == 0:
-            out_dic[k] = []
-            continue
+        entity = series.get("entity")
+        metric = series.get("metric")
+        time_values = series.get("time")
+        values = series.get("values")
 
-        # 1. Keep ts exactly as it is
-        if k == "ts":
-            out_dic[k] = vlist
+        if not entity:
+            return jsonify(error="Each series must contain 'entity'"), 400
 
-        # 2. Strings -> add "_m" to each string
-        elif isinstance(vlist[0], str):
-            out_dic[k] = [f"{item}_m" for item in vlist]
+        if not metric:
+            return jsonify(error="Each series must contain 'metric'"), 400
 
-        # 3. Numbers (int or float) -> keep first 3 digits
-        elif isinstance(vlist[0], (int, float)):
-            out_dic[k] = [first_3_digits_as_int(item) for item in vlist]
+        if not isinstance(time_values, list):
+            return jsonify(error=f"Series {entity}/{metric}: 'time' must be a list"), 400
 
-        # 4. Anything else -> return as is
+        if not isinstance(values, list):
+            return jsonify(error=f"Series {entity}/{metric}: 'values' must be a list"), 400
+
+        if len(time_values) != len(values):
+            return jsonify(
+                error=(
+                    f"Series {entity}/{metric}: length mismatch. "
+                    f"time has {len(time_values)}, values has {len(values)}"
+                )
+            ), 400
+
+        if not base_time and len(time_values) > 0:
+            base_time = time_values
+            base_values = values
+
+    x_pred = []
+    y_pred = []
+    z_pred = []
+
+    for i, value in enumerate(base_values):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            x = first_3_digits_as_int(value)
+        elif isinstance(value, str):
+            x = first_3_digits_as_int(value)
         else:
-            out_dic[k] = vlist
+            x = 0
 
-    print(f"out_dic: {out_dic}")
+        x_pred.append(x)
+        y_pred.append(x + 1)
+        z_pred.append(i % 2 == 0)
 
-    return jsonify(out_dic)
+    out_payload = {
+        "x_pred": x_pred,
+        "y_pred": y_pred,
+        "z_pred": z_pred,
+        "ts": base_time,
+    }
+
+    print(f"out_payload: {out_payload}")
+
+    return jsonify(out_payload)
 
 
 if __name__ == "__main__":
-    # Runs on 0.0.0.0:8080 to match your listener flags
     app.run(host="0.0.0.0", port=8080)
