@@ -237,6 +237,12 @@ def parse_args() -> argparse.Namespace:
 
     # Polling cadence and LEAF limit
     p.add_argument("--everyTs", type=int, required=True, help="Polling cadence in seconds")
+    p.add_argument(
+        "--queryDelayS",
+        type=int,
+        default=0,
+        help="Delay query window by N seconds to allow LEAF data to become available"
+    )
     p.add_argument("--limit", type=int, default=1000, help="Maximum rows per LEAF polling window")
 
     # MQTT write-back parameters
@@ -557,6 +563,9 @@ def main() -> None:
     if args.limit <= 0:
         raise SystemExit("--limit must be a positive integer.")
 
+    if args.queryDelayS < 0:
+        raise SystemExit("--queryDelayS must be zero or positive.")
+
     api_url = env_or(args.api_url, "LEAF_API_URL")
     token = env_or(args.token, "LEAF_API_TOKEN")
 
@@ -574,8 +583,8 @@ def main() -> None:
     session = requests.Session()
 
     now_s = int(dt.datetime.now(timezone.utc).timestamp())
-    start_s = now_s - args.everyTs
-    stop_s = now_s
+    stop_s = now_s - args.queryDelayS
+    start_s = stop_s - args.everyTs
 
     tick = time.monotonic()
 
@@ -683,7 +692,7 @@ def main() -> None:
             tick = time.monotonic()
 
         start_s = stop_s
-        stop_s = int(dt.datetime.now(timezone.utc).timestamp())
+        stop_s = int(dt.datetime.now(timezone.utc).timestamp()) - args.queryDelayS
 
 
 # =========================================================
