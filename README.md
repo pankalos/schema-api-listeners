@@ -581,61 +581,83 @@ The exact numeric values depend on the dummy logic.
 
 ---
 
-## 12. Using the modeler in schema-api
+## 12. Creating a streaming task with this modeler
 
-When creating a new `leaf-influx` streaming task through `schema-api`, provide the modeler image like this:
+To use a modeler in `schema-api`, create a new `leaf-influx` streaming task.
 
-```json
-"modeler": {
-  "image": "your-dockerhub-user/leaf-modeler:latest",
-  "port": 8080,
-  "endpoint": "model",
-  "args": ["python", "modeler.py"]
-}
-```
-
-Example source configuration:
+Example request body:
 
 ```json
-"source": {
-  "api_url": "https://portal.m-unlock.com/api/data",
-  "token": "<LEAF_API_TOKEN>",
-  "organisation": "WUR",
-  "department": "SSB",
-  "entity_metrics_set": [
-    {
-      "entity": "D0167289",
-      "metrics": ["Temperature.process-value"]
+{
+  "streaming": "leaf-influx",
+  "data": {
+    "source": {
+      "api_url": "<LEAF_API_URL>",
+      "token": "<LEAF_API_TOKEN>",
+      "organisation": "WUR",
+      "department": "SSB",
+      "entity_metrics_set": [
+        {
+          "entity": "D0167289",
+          "metrics": ["Temperature.process-value"]
+        },
+        {
+          "entity": "ssb.bioind4",
+          "metrics": ["mem.used"]
+        }
+      ],
+      "everyTs": 20,
+      "queryDelayS": 30,
+      "limit": 100
     },
-    {
-      "entity": "ssb.bioind4",
-      "metrics": ["mem.used"]
+    "modeler": {
+      "image": "<your-dockerhub-modeler-image>:<tag>",
+      "port": 8080,
+      "endpoint": "model",
+      "args": ["python", "modeler.py"]
+    },
+    "mqtt": {
+      "host": "<MQTT_HOST>",
+      "port": 443,
+      "username": "<MQTT_USERNAME>",
+      "password": "<MQTT_PASSWORD>",
+      "topic": "<MQTT_TOPIC>",
+      "basepath": "mqtt",
+      "measurement": "model_predictions",
+      "output_tags": [
+        "workflow=test",
+        "producer=leaf-listener",
+        "model=dummy-v1"
+      ]
     }
-  ],
-  "everyTs": 10,
-  "queryDelayS": 30,
-  "limit": 100
+  }
 }
 ```
 
-Example MQTT write-back configuration:
+Field notes:
 
-```json
-"mqtt": {
-  "host": "mqtt.wide-unlock-prd.wide.wur.nl",
-  "port": 443,
-  "username": "<MQTT_USERNAME>",
-  "password": "<MQTT_PASSWORD>",
-  "topic": "athenarc/test/ilp",
-  "basepath": "mqtt",
-  "measurement": "model_predictions",
-  "output_tags": [
-    "workflow=test",
-    "producer=leaf-listener",
-    "model=dummy-v1"
-  ]
-}
-```
+* `source.api_url`: LEAF API endpoint.
+* `source.token`: LEAF API token.
+* `source.organisation`: LEAF organisation.
+* `source.department`: LEAF department.
+* `source.entity_metrics_set`: explicit entity/metric pairs to request from LEAF.
+* `source.everyTs`: polling window size in seconds.
+* `source.queryDelayS`: delay the queried window by this many seconds, useful when LEAF data appears with a small delay.
+* `source.limit`: maximum number of LEAF rows returned per polling window.
+* `modeler.image`: Docker image of the modeler.
+* `modeler.port`: port exposed by the modeler container.
+* `modeler.endpoint`: HTTP endpoint exposed by the modeler, usually `model`.
+* `modeler.args`: command used to start the modeler inside the container.
+* `mqtt.host`: MQTT broker host.
+* `mqtt.port`: MQTT broker port.
+* `mqtt.username`: MQTT username.
+* `mqtt.password`: MQTT password.
+* `mqtt.topic`: MQTT topic where line protocol rows will be published.
+* `mqtt.basepath`: MQTT WebSocket path, usually `mqtt`.
+* `mqtt.measurement`: Influx line protocol measurement name.
+* `mqtt.output_tags`: tags added to every line protocol row.
+
+The listener will create one LEAF API request per polling window, send the resulting time-series payload to the modeler, receive modeler predictions, convert them to Influx line protocol, and publish them to MQTT.
 
 ---
 
